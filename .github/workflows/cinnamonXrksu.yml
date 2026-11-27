@@ -25,6 +25,119 @@ jobs:
           sed -i 's/depends on OVERLAY_FS/depends on EXT4_FS/g' KernelSU/kernel/Kconfig
           sed -i 's/depends on KPROBES/depends on EXT4_FS/g' KernelSU/kernel/Kconfig
           sed -i 's/default n/default y/g' KernelSU/kernel/Kconfig
+    - name: Auto-Inject RKSU Legacy Hooks & Defconfig
+      run: |
+          python3 - << 'EOF'
+          import os, re, glob
+
+          def read_file(path):
+              with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                  return f.read()
+
+          def write_file(path, content):
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(content)
+
+          # 1. fs/exec.c
+          exec_c = read_file('fs/exec.c')
+          if 'ksu_handle_execve_sucompat' not in exec_c and 'ksu_handle_execveat_sucompat' not in exec_c:
+              m = re.search(r'(static\s+int\s+do_execve_common\s*\(([^)]+)\)\s*\{)', exec_c)
+              if m:
+                  sig, params = m.group(1), m.group(2)
+                  is_struct = 'struct filename' in params
+                  fn_name = 'ksu_handle_execveat_sucompat' if is_struct else 'ksu_handle_execve_sucompat'
+                  param_type = 'struct filename **' if is_struct else 'const char **'
+                  decl = f"\n#ifdef CONFIG_KSU\nextern bool ksu_execveat_hook __read_mostly;\nextern int {fn_name}(int *fd, {param_type}filename_ptr, void *argv, void *envp, int *flags);\n#endif\n"
+                  exec_c = exec_c.replace(sig, decl + sig, 1)
+                  hook = f"\n#ifdef CONFIG_KSU\n\t{fn_name}((int *)AT_FDCWD, &filename, NULL, NULL, NULL);\n#endif\n"
+                  exec_c = re.sub(r'(\n\s*(?:retval\s*=|if\s*\(IS_ERR\(filename\)\)|bprm\s*=))', hook + r'\1', exec_c, count=1)
+                  write_file('fs/exec.c', exec_c)
+
+          # 2. fs/open.c
+          open_c = read_file('fs/open.c')
+          if 'ksu_handle_faccessat' not in open_c:
+              m = re.search(r'(SYSCALL_DEFINE3\s*\(\s*faccessat\s*,[^)]+\)\s*\{)', open_c)
+              if m:
+                  sig = m.group(1)
+                  decl = "\n#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n"
+                  open_c = open_c.replace(sig, decl + sig, 1)
+                  hook = "\n#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n"
+                  open_c = re.sub(r'(SYSCALL_DEFINE3\s*\(\s*faccessat\s*,[^)]+\)\s*\{(?:[^{}]*?;)*)', r'\1' + hook, open_c, count=1)
+                  write_file('fs/open.c', open_c)
+
+          # 3. fs/read_write.c
+          rw_c = read_file('fs/read_write.c')
+          if 'ksu_handle_vfs_read' not in rw_c:
+              m = re.search(r'(ssize_t\s+vfs_read\s*\([^)]+\)\s*\{)', rw_c)
+              if m:
+                  sig = m.group(1)
+                  decl = "\n#ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\nextern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n#endif\n"
+                  rw_c = rw_c.replace(sig, decl + sig, 1)
+                  hook = "\n#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n#endif\n"
+                  rw_c = re.sub(r'(\n\s*if\s*\(\s*!\s*\(\s*file->f_mode\s*&\s*FMODE_READ\s*\)\s*\))', hook + r'\1', rw_c, count=1)
+                  write_file('fs/read_write.c', rw_c)
+
+          # 4. fs/stat.c
+          stat_c = read_file('fs/stat.c')
+          if 'ksu_handle_stat' not in stat_c:
+              m = re.search(r'(int\s+vfs_fstatat\s*\([^)]+\)\s*\{)', stat_c)
+              if m:
+                  sig = m.group(1)
+                  decl = "\n#ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\n"
+                  stat_c = stat_c.replace(sig, decl + sig, 1)
+                  hook = "\n#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif\n"
+                  stat_c = re.sub(r'(int\s+vfs_fstatat\s*\([^)]+\)\s*\{(?:[^{}]*?;)*)', r'\1' + hook, stat_c, count=1)
+                  write_file('fs/stat.c', stat_c)
+
+          # 5. drivers/input/input.c
+          input_c = read_file('drivers/input/input.c')
+          if 'ksu_handle_input_handle_event' not in input_c:
+              m = re.search(r'(void\s+input_event\s*\([^)]+\)\s*\{)', input_c)
+              if m:
+                  sig = m.group(1)
+                  decl = "\n#ifdef CONFIG_KSU\nextern bool ksu_input_hook __read_mostly;\nextern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n"
+                  input_c = input_c.replace(sig, decl + sig, 1)
+                  hook = "\n#ifdef CONFIG_KSU\n\t\tif (unlikely(ksu_input_hook))\n\t\t\tksu_handle_input_handle_event(&type, &code, &value);\n#endif\n"
+                  input_c = re.sub(r'(if\s*\(\s*is_event_supported\s*\(\s*type\s*,\s*dev->evbit\s*,\s*EV_MAX\s*\)\s*\)\s*\{)', r'\1' + hook, input_c, count=1)
+                  write_file('drivers/input/input.c', input_c)
+
+          # 6. kernel/sys.c
+          sys_c = read_file('kernel/sys.c')
+          if 'ksu_handle_prctl' not in sys_c:
+              m = re.search(r'(SYSCALL_DEFINE5\s*\(\s*prctl\s*,[^)]+\)\s*\{)', sys_c)
+              if m:
+                  sig = m.group(1)
+                  decl = "\n#ifdef CONFIG_KSU\nextern int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5);\n#endif\n"
+                  sys_c = sys_c.replace(sig, decl + sig, 1)
+                  hook = "\n#ifdef CONFIG_KSU\n\tksu_handle_prctl(option, arg2, arg3, arg4, arg5);\n#endif\n"
+                  sys_c = re.sub(r'(SYSCALL_DEFINE5\s*\(\s*prctl\s*,[^)]+\)\s*\{(?:[^{}]*?;)*)', r'\1' + hook, sys_c, count=1)
+                  write_file('kernel/sys.c', sys_c)
+
+          # 7. Defconfig (RKSU Manual Hook + OverlayFS + Disable Kprobes)
+          ksu_configs = [
+              "CONFIG_KSU=y",
+              "CONFIG_KSU_MANUAL_HOOK=y",
+              "CONFIG_KSU_KPROBES_HOOK=n",
+              "CONFIG_KSU_LSM_SECURITY_HOOKS=y",
+              "CONFIG_KSU_DEBUG=n",
+              "CONFIG_OVERLAY_FS=y",
+              "# CONFIG_KPROBES is not set",
+              "# CONFIG_HAVE_KPROBES is not set",
+              "# CONFIG_KRETPROBES is not set"
+          ]
+
+          for cfg in glob.glob('arch/*/configs/*defconfig'):
+              txt = read_file(cfg)
+              lines = txt.splitlines()
+              cleaned = [
+                  l for l in lines
+                  if not re.match(r'^(?:#\s*)?CONFIG_(?:KSU|OVERLAY_FS|KPROBES|HAVE_KPROBES|KRETPROBES)(?:_[A-Z0-9_]+)?(?:=|\s+is\s+not\s+set)', l)
+              ]
+              cleaned.extend(ksu_configs)
+              write_file(cfg, "\n".join(cleaned) + "\n")
+          EOF
+
+          
           # 1. Hapus lsm_hooks.h & perbaiki inisialisasi core_hook.c
           sed -i '/#include <linux\/lsm_hooks.h>/d' KernelSU/kernel/*.c KernelSU/kernel/*.h
           sed -i '693,$d' KernelSU/kernel/core_hook.c
